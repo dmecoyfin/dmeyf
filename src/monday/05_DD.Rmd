@@ -1,0 +1,314 @@
+---
+title: "Ruido y + ruido"
+date: "2021-09-20"
+version: 0.7
+output: 
+  html_document:
+    theme: spacelab
+    highlight: monochrome
+    df_print: paged
+#    toc: true
+#    toc_depth: 2
+vignette: >
+  %\VignetteEncoding{UTF-8}
+  %\VignetteEngine{knitr::rmarkdown}
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+> "All that gliters is not gold" --- William Shakespeare
+
+Hoy veremos algunos fenómenos más sobre nos pueden quitar el sueño si no sabemos de ellos y no operamos a conciencia.
+
+El primero que veremos es el efecto de la separación del **leaderboard** público y privado.
+Los pasos son los siguientes.
+
+-   Se toma el dataset de **noviembre**
+
+-   Se divide de forma estratificada 30 / 70
+
+-   La componente con el 30% es la que se usa para evaluar el **leaderboard público**, y la componente con el 70% la que se usa para el **leaderboard privado**
+
+-   Se escalan las ganancias según su proporción.
+
+-   Se gana mirando de forma única el **leaderboard privado**.
+
+Algún alumno memorioso recordará que la separación, por más estratificada que sea, puede ser muy venenosa.
+
+Nosotros desconocemos la semilla, pero si usamos datos de un pasado más lejano, vamos a poder cuanto menos entender sus efectos.
+Ustedes en este punto de la materia no tienen esos datos.
+Sin embargo yo si!
+y les puedo mostrar cosas interesantes.
+
+```{r}
+
+rm( list=ls() )
+gc()
+
+```
+
+Vamos a irnos unos 4 años en el pasado, usando los mismos meses que en esta competencia.
+
+```{r}
+
+library("data.table")
+library("lightgbm")
+
+carpeta_datasetsOri <-  "../../../datasetsOri/"
+septiembre <- "paquete_premium_201709.csv"
+noviembre <- "paquete_premium_201711.csv"
+
+
+ds <- fread(paste0(carpeta_datasetsOri, septiembre,collapse = ""), showProgress = FALSE)
+clase_binaria <- ifelse(ds$clase_ternaria == "BAJA+2", 1, 0)
+ds$clase_ternaria <- NULL
+
+```
+
+Vamos a usar una alternativa al **xgboost**, un **lightgbm**
+
+**Pregunta (para Ale)**
+
+-   ¿ En que se diferencian las dos implementaciones ?
+
+Vamos a usar la parametrización que **Gustavo** encontró y demuestra ser muy útil.
+
+```{r, echo=FALSE}
+ds_train  <- lgb.Dataset( data=  data.matrix(ds), label= clase_binaria )
+
+ganancia_lgb <- function(probs, datos){
+  return( list( "name"= "ganancia", 
+                "value"=  sum( (probs > 0.025  )* ifelse( getinfo(datos, "label")== 1, 48750, -1250 ) ) / 0.2,
+                "higher_better"= TRUE ) )
+}
+
+set.seed(17)
+m1 <- lgb.cv( data= ds_train,
+         eval= ganancia_lgb,
+         stratified= TRUE,
+         nfold= 5,
+         param= list( objective= "binary",
+                       max_bin= 15,
+                       min_data_in_leaf= 4000,
+                       learning_rate= 0.05 
+                       )
+      )
+```
+
+```{r}
+m1$best_iter
+unlist(m1$record_evals$valid$ganancia$eval)[ m1$best_iter ]
+```
+
+No sabemos realmente si es bueno o no, ya que no tenemos las referencias de las ganancias en el año 2017.
+Sin embargo, si lo comparamos con los parámetros por **default,** es muy superior.
+Sin embargo, para nuestro experimento es innecesario.
+
+Vamos a aplicarlo en **noviembre 2017**.
+
+```{r}
+
+m2  <- lightgbm( data= ds_train,
+                 params= list( objective= "binary",
+                                   max_bin= 15,
+                                   min_data_in_leaf= 4000,
+                                   learning_rate= 0.05), verbose = -1)
+
+
+ds_nov <- fread(paste0(carpeta_datasetsOri, noviembre,collapse = ""), showProgress = FALSE)
+
+nov_binaria <- ifelse(ds_nov$clase_ternaria == "BAJA+2", 1, 0)
+
+ds_nov$clase_ternaria <- NULL
+prob <- predict( m2,  data.matrix(ds_nov))
+
+sum( (prob > 0.025  )* ifelse( nov_binaria == 1, 48750, -1250 ) )
+
+```
+
+Respecto al **CV** estamos muy abajo.
+No prestemos atención a esta diferencia, ya que no es así como vamos a ser medidos.
+Concentremos en como se vería estos números en un **leaderboad**.
+
+Generamos 1000 **leaderboard**
+
+```{r}
+leaderboad <- data.table()
+set.seed(17)
+for (i in 1:1000) {
+  split <- caret::createDataPartition(nov_binaria, p = 0.70, list = FALSE)
+  privado  <-  sum( (prob[split] > 0.025  )* ifelse( nov_binaria[split] == 1, 48750, -1250 ) ) / 0.7
+  publico   <- sum( (prob[-split] > 0.025  )* ifelse( nov_binaria[-split] == 1, 48750, -1250 ) ) / 0.3   
+  leaderboad <- rbindlist(list(leaderboad,  data.table(priv = privado, publ= publico)))
+} 
+
+# Agregamos los rank para hacer más simple la interpretación
+
+leaderboad$r_priv <- frank(leaderboad$priv)
+leaderboad$r_publ <- frank(leaderboad$publ)
+
+leaderboad
+```
+
+**Pregunta**
+
+-   ¿Qué conclusiones saca al ver los valores?
+
+    -   Respecto al valor real
+
+    -   Respecto a la relación entre el **público** y el **privado**
+
+Gráfiquemos las distribuciones de ambos **leaderboards**
+
+```{r}
+library(ggplot2)
+df <- melt(leaderboad, measure.vars =  c("priv", "publ"))
+ggplot(df, aes(x=value, color=variable)) + geom_density()
+
+```
+
+Sólo estoy mirando con un modelo, pero puede pasar que esto afecte a todos los modelos que suba, y a la semilla se afecte por igual a todos.
+
+Probemos entonces si esto pasa usando 3 modelos.
+
+La única diferencia, va a ser de 0.01 puntos en el `feature_fraction`.
+
+```{r, echo=FALSE}
+params_base <- list( objective= "binary",
+                                   max_bin= 15,
+                                   min_data_in_leaf= 4000,
+                                   learning_rate= 0.05)
+set.seed(17)
+m3  <- lightgbm( data= ds_train, params=c(params_base, feature_fraction = 0.59) , verbose = -1)
+m4  <- lightgbm( data= ds_train, params=c(params_base, feature_fraction = 0.60) , verbose = -1)
+m5  <- lightgbm( data= ds_train, params=c(params_base, feature_fraction = 0.61) , verbose = -1)
+
+```
+
+```{r}
+prob_m3 <- predict( m3,  data.matrix(ds_nov))
+prob_m4 <- predict( m4,  data.matrix(ds_nov))
+prob_m5 <- predict( m5,  data.matrix(ds_nov))
+
+```
+
+```{r}
+leaderboad2 <- data.table()
+set.seed(17)
+for (i in 1:100) {
+  split <- caret::createDataPartition(nov_binaria, p = 0.70, list = FALSE)
+  privado_m3  <-  sum( (prob_m3[split] > 0.025  )* ifelse( nov_binaria[split] == 1, 48750, -1250 ) ) / 0.7
+  publico_m3   <- sum( (prob_m3[-split] > 0.025  )* ifelse( nov_binaria[-split] == 1, 48750, -1250 ) ) / 0.3   
+  
+    privado_m4  <-  sum( (prob_m4[split] > 0.025  )* ifelse( nov_binaria[split] == 1, 48750, -1250 ) ) / 0.7
+  publico_m4   <- sum( (prob_m4[-split] > 0.025  )* ifelse( nov_binaria[-split] == 1, 48750, -1250 ) ) / 0.3   
+  
+    privado_m5  <-  sum( (prob_m5[split] > 0.025  )* ifelse( nov_binaria[split] == 1, 48750, -1250 ) ) / 0.7
+  publico_m5   <- sum( (prob_m5[-split] > 0.025  )* ifelse( nov_binaria[-split] == 1, 48750, -1250 ) ) / 0.3   
+  
+  leaderboad2 <- rbindlist(list(leaderboad2,  data.table(priv_m3 = privado_m3, publ_m3= publico_m3, priv_m4 = privado_m4, publ_m4= publico_m4, priv_m5 = privado_m5, publ_m5= publico_m5)))
+} 
+
+
+leaderboad2
+```
+
+**Preguntas**
+
+-   ¿Qué conclusiones puede sacar?
+-   ¿Significa esto que si alguien esta por arriba de mi humilde **árbol** en el público con su **lightgbm** es el privado está por el piso?
+-   ¿Puedo hiperparametrizar usando el **público** como validación?
+-   ¿Cómo uso entonces el público?
+
+**IMPORTANTE**
+
+**Kaggle** por defecto selecciona el mejor modelo en el **público** para el privado.
+Sin embargo, ustedes pueden selección a mano cual es el quieren que compita en el **privado**.
+
+**BREAK** $$\\[3in]$$
+
+> ... nadie puede bañarse dos veces en un mismo río, porque aunque aparentemente el río es el mismo, sus elementos, su cauce, el agua que corre por él, han cambiado.
+>
+> --- Heráclito
+
+Los clientes cambian con el paso del tiempo, y estos cambios le van afectar a los modelos.
+Empecemos a estudiar los efectos de esos cambios, lo cuál se llama **data drift.**
+
+**Pregunta**
+
+-   ¿Qué ejemplo puede mencionar sobre *data drift*?
+
+Los sistemas son construidos por humanos.
+Y es importantes el plural, antes de llegar a nosotros desde el sistema de origen pasa por una serie de procesos escritos por diferentes *actores,* lo que hace que sea propenso la existencia de errores **presentes**, como errores **futuros**.
+
+**Pregunta**
+
+-   ¿Qué ejemplo puede mencionar sobre *data quality*?
+
+Estamos en frente a dos efectos que pueden, y lo hacen, cambiar los datos que vamos a *scorear* frente a los datos que usamos para entrenar.
+
+**Pregunta**
+
+-   ¿Cómo podemos diferenciar uno del otro?
+
+Haciendo uso de **EDA** de septiembre, el mismo análisis para *noviembre* y los `scripts` que pasó Gustavo `311` y `312`, veamos algunas variables que quizás cambiaron entre los 2 meses, y tratemos de:
+
+-   Si sufrió o no algún cambio en su estructura
+
+-   Si lo sufrió, ¿a qué se debió?
+
+-   Creemos que ese cambio va a afectar **negativamente** a nuestro modelo
+
+¿Podemos reparar la variable si pensamos que va a afectar negativamente?
+
+-   ¿Cómo?
+
+-   Y si no podemos, ¿qué hacemos?
+
+Veamos según nuestro modelo, cuáles son las variables más importantes y que a su vez cuales son las variables más importantes y sobre las que tenemos que tener más cuidado
+
+```{r}
+
+septiembre2020 <- "paquete_premium_202009.csv"
+
+ds_2020 <- fread(paste0(carpeta_datasetsOri, septiembre2020,collapse = ""), showProgress = FALSE)
+clase_binaria_2020 <- ifelse(ds_2020$clase_ternaria == "BAJA+2", 1, 0)
+ds_2020$clase_ternaria <- NULL
+
+ds_train_2020  <- lgb.Dataset( data=  data.matrix(ds_2020), label= clase_binaria_2020 )
+
+m_2020  <- lightgbm( data= ds_train_2020, params=c(params_base, feature_fraction = 0.61) , verbose = -1)
+
+lgb.importance(m_2020)
+```
+
+**Pregunta**
+
+-   ¿Qué pasa si sacamos las variables más importantes? ¿Qué espera que pase en el modelo?
+
+> "Transformation is a journey without a final destination" --- Marilyn Ferguson
+
+La esencia del **feature engineering** consiste en modificar los datos para ayudar al modelo a obtener una mejor performance.
+
+Las transformaciones pueden ser sobre
+
+-   Una variable
+
+    -   Adaptarla para que el algoritmo puede usarla
+
+        -   ¿Ejemplos?
+
+    -   Alterarla para que se adapte mejor a como funciona el algoritmo
+
+        -   ¿Ejemplos?
+
+        -   Entendiendo como funcionan los árboles, ¿qué transformaciones tienen sentido y cuáles no?
+
+    -   Otras
+
+-   Varias variables juntas para crear, principalmente para dejar al algoritmo disponibles datos que a le son difíciles de separar.
+
+    -   ¿Ejemplos?
+
+    -   ¿Formas de juntar variables?

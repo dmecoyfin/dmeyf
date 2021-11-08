@@ -1,0 +1,222 @@
+---
+title: "Conectando al negocio"
+author: "Alejandro Bolaños"
+date: "2019-10-04"
+version: 0.7
+output: 
+  html_document:
+    theme: spacelab
+    highlight: monochrome
+    df_print: paged
+#    toc: true
+#    toc_depth: 2
+
+vignette: >
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+> If you don't collect any metrics, you're flying blind. If you collect and focus on too many, they may be obstructing your field of view.
+
+―-- Scott M. Graffius
+
+El foco de esta práctica es como comunicar los resultados a las áreas de negocio y como sugerir la utilización de los modelos.
+
+No es simple sentarse hablar con los usuarios de negocios contando las bondades de nuestro modelo usando el área bajo la curva.
+
+En nuestro problema, contamos con el cálculo del `profit`, algo con lo que no siempre se cuenta.
+
+```{r}
+
+rm( list=ls() )
+gc()
+
+```
+
+Generamos un modelo sobre el que vamos a hacer las mediciones
+
+```{r}
+library("data.table")
+library("lightgbm")
+
+carpeta_datasetsOri <-  "../../../datasetsOri/"
+septiembre <- "paquete_premium_201709.csv"
+noviembre <- "paquete_premium_201711.csv"
+
+
+ds <- fread(paste0(carpeta_datasetsOri, septiembre,collapse = ""), showProgress = FALSE)
+clase_binaria <- ifelse(ds$clase_ternaria == "BAJA+2", 1, 0)
+ds$clase_ternaria <- NULL
+
+ds_train  <- lgb.Dataset( data=  data.matrix(ds), label= clase_binaria )
+
+folds <- splitTools::create_folds(clase_binaria, k = 5, seed = 17)
+res <- data.table()
+
+
+params_gbdt <- list( objective= "binary", max_bin= 15, min_data_in_leaf= 4000, learning_rate= 0.05 )
+
+validation <- numeric(length(clase_binaria))
+
+for (f in folds) {
+  ds_train  <- lgb.Dataset( data=  data.matrix(ds[f]), label= clase_binaria[f] )
+  m <- lgb.train(ds_train, params = params_gbdt, verbose = -1)
+  validation[-f] <- predict(m,data.matrix(ds[-f]))
+}
+
+```
+
+```{r}
+tablescore <- data.table(clase = clase_binaria, score = validation)
+```
+
+## Áreas de riesgo
+
+Las áreas de riesgo tradicionalmente miran como estadístico el KS (por Kolmogorov-Smirnov) que consiste en una prueba que mide la similitud entre las distribuciones de buenos y malos.
+
+Para este debemos separar las probabilidades de unos y otros
+
+```{r}
+library(ggplot2)
+
+ggplot(tablescore, aes(x=score)) +
+    facet_grid(clase ~ .,scales = "free_y") +
+     geom_density()
+
+```
+
+Las diferencias entre las dos distribuciones se miden buscando la diferencia máxima entre las distribuciones acumuladas. Para calcularlo vamos a dividir la probabilidad calculada en 20 bucket y calcular la separación entre cada distribución. La máxima separación será nuestro KS (multiplicado por 100 al mencionarlo)
+
+```{r}
+facum_bajas2 <- ecdf(tablescore[clase == 1, score])
+facum_nobajas2 <- ecdf(tablescore[clase == 0, score])
+
+q <-
+  quantile(
+    tablescore$score,
+    probs = seq(0, 1, by = 0.05),
+    names = FALSE
+  )
+
+ksplot <- rbind(data.frame(p = sapply(q, facum_bajas2), clase = 1, q),
+                data.frame(p = sapply(q, facum_nobajas2), clase = 0, q))
+
+ggplot(ksplot, aes(x = factor(signif(q, digits = 4)), y = p)) +
+  geom_point(aes(colour = factor(clase)), size = 1.5) +
+  geom_line(aes(colour = factor(clase), group = factor(clase))) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+
+Donde la máxima separación es
+
+```{r}
+
+ks_dt <-
+  data.table(bin = 1:length(q),
+             q = q,
+             ks = 100 * abs((
+               sapply(q, function (q)
+                 facum_bajas2(q) - facum_nobajas2(q))
+             )))
+
+ks_dt
+
+```
+
+```{r}
+
+ks_dt[ks==max(ks),]
+
+```
+
+## Métricas de negocio
+
+Acercar los resultados de los modelos y su utilización al negocio es casi un arte. Veamos a continuación algunas métricas que le muestran al negocio como ver la mejora del modelo.
+
+### Ganancia (captura) acumulada
+
+Porcentaje de clientes que se van a ir que capturamos si elegimos al porcentaje `X` de los clientes con mayor probabilidad en nuestro modelo de propensión.
+
+Vamos a tomar como ejemplo, que vamos a evaluar a solo el mejor `5%`, o lo que es lo mismo, el primer `semidecil`:
+
+```{r}
+library(Hmisc)
+
+tablescore$bin <- as.integer(cut2(tablescore$score, g=20))
+tablescore$bin <-  (21 - tablescore$bin)*5
+
+setorder(tablescore, bin, score)
+
+```
+
+```{r}
+total_bajas <- sum(tablescore$clase)
+
+captura_acum <- tablescore[, .(captura = sum(clase)) , by = bin]
+captura_acum[, captura_acum := cumsum(captura)]
+captura_acum[, captura_acum_porc := (captura_acum / total_bajas) * 100]
+captura_acum <- rbindlist(list(
+  data.table(
+    bin = 0,
+    captura = 0,
+    captura_acum = 0,
+    captura_acum_porc = 0
+  ),
+  captura_acum
+))
+
+captura_acum
+
+ggplot(captura_acum, aes(x = bin, y = captura_acum_porc))+
+  geom_point(size = 1.5)+
+  geom_line()
+
+```
+
+### Lift acumulado
+
+El lift muestra la mejora sobre el porcentaje por defecto de la clase. Esta es una de las métricas más usadas que complementa el `auc`
+
+```{r}
+
+ratio_clase <- total_bajas / length(tablescore$clase)
+
+lift_acum <- tablescore[, .(captura = sum(clase), n=.N) , by = bin]
+lift_acum[, c("captura_acum", "n_acum") := list(cumsum(captura),cumsum(n))]
+lift_acum[, lift_acum := (captura_acum / n_acum) / ratio_clase]
+
+lift_acum
+
+ggplot(lift_acum, aes(x = bin, y = lift_acum))+
+  geom_point(size = 1.5)+
+  coord_cartesian(xlim = c(0, 100), ylim = c(0, 13)) + 
+  geom_line() + geom_hline(yintercept = 1)
+
+```
+
+### Respuesta acumulada
+
+Nos sirve para ver que porcentaje de clientes que se van a abordar, corresponden al `target`.
+
+```{r}
+
+resp_acum <- tablescore[, .(captura = sum(clase), n=.N) , by = bin]
+resp_acum[, c("captura_acum", "n_acum") := list(cumsum(captura),cumsum(n))]
+resp_acum[, resp_acum := (captura_acum / n_acum)*100]
+
+resp_acum
+
+ggplot(resp_acum, aes(x = bin, y = resp_acum))+
+  geom_point(size = 1.5)+
+  geom_line() + geom_hline(yintercept = ratio_clase*100)
+
+```
+
+Las métricas anteriores tienen su versión no acumulada. Pero como la importancia de negocio se se focalizada en los porcentajes de clientes que se van a abordar, es más útil ver las curvas acumuladas para tomar una decisión.
+
+### Profit
+
+Como recordatorio, es importante tener presente que el cálculo de ganancia depende de la matriz de profit, que se compone de los `tp`, `fp`, `tn` y `fn`. En el problema que estamos trabajando, sólo usamos los primeros dos valores, pero no siempre esto es así.
+
+------------------------------------------------------------------------

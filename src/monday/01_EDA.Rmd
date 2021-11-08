@@ -1,0 +1,312 @@
+---
+title: "E.D.A.: Exploratory data analysis"
+
+date: "2020-08-23"
+version: 0.91 
+output: 
+  html_document:
+    theme: spacelab
+    highlight: monochrome
+    df_print: paged
+#    toc: true
+#    toc_depth: 2
+
+vignette: >
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{css, echo=FALSE}
+.tarea {
+  padding: 1em;
+  border: 2px solid red;
+  border-radius: 10px;
+  margin-bottom: 10px;
+}
+```
+
+> If the statistics are boring, then you've got the wrong numbers. --- Edward R. Tufte
+
+Para esto empezamos limpiando los objectos del entorno que se encuentran memoria.
+
+```{r }
+
+rm( list=ls() )
+gc()
+
+```
+
+Invocamos la *gran* librería `data.table` para manipulación de datos y para las visualizaciones vamos a usar la librería `ggplot2`.
+
+```{r }
+library( "data.table")
+library("ggplot2")
+
+```
+
+Definimos las variables los paths donde encontrar los datasets.
+
+```{r}
+carpeta_datasetsOri <-  "../../../datasetsOri/"
+septiembre <- "paquete_premium_202009.csv"
+
+```
+
+Vamos a cargar los datos a memoria.
+
+```{r}
+
+ds <- fread(paste0(carpeta_datasetsOri, septiembre,collapse = ""), header=TRUE, showProgress = FALSE)
+
+```
+
+Visualizamos las primeras filas, es una forma de ir metiendo las manos en la masa. Si bien puede parecer que esto tiene poco valor, somos seres que seguimos necesitando ver las cosas con nuestros ojos.
+
+```{r}
+
+head(ds, 10)
+# View(head(ds, 500)) # Para poder visualizar más registros desde RStudio
+
+```
+
+Empezamos poniendo el foco sobre la variable target, tratamos de entender la cantidad de **churn** presente.
+
+```{r}
+
+target <- dcast(ds, foto_mes ~ clase_ternaria,
+           length, 
+           value.var = "clase_ternaria" )
+
+
+target
+```
+
+Y calculamos el porcentaje de **churn** del mes de Septiembre 2020
+
+```{r}
+
+churn <- target$`BAJA+2` / (target$`BAJA+2` + target$`BAJA+1` + target$CONTINUA)  
+
+churn*100
+```
+
+Vemos la clara "escasez" de *BAJA+2*
+
+**Pregunta**:
+
+-   ¿Qué podemos decir del *ratio* de *BAJA+1*?
+
+Pasamos a ver las variables que hacen nuestro conjunto de datos.
+
+::: {.tarea}
+**TAREA**
+
+Todos los análisis a continuación se deberán realizar con el diccionario de datos a la par. Pocas tareas serán tan importantes como esta.
+:::
+
+Examinemos la estructura de las variables independientemente. Exploremos los estadísticos del mes de Septiembre 2020, usando la librería `dataMaid`, sin ninguna preferencia sobre otras, en este punto reina la pereza de escribir uno el código.
+
+```{r, max.height='100px'}
+# install.packages("dataMaid")
+
+library('dataMaid')  
+# Produce un "lindo" reporte 
+# makeDataReport(ds,render = FALSE, file = "01_EDA_ds.Rmd", replace = TRUE) 
+
+s <- summarize(ds, reportstyleOutput = TRUE)
+
+```
+
+**cliente_antiguedad**
+
+```{r}
+
+s$cliente_antiguedad
+```
+
+**clase_ternaria**
+
+```{r}
+
+s$clase_ternaria
+```
+
+Examine los estadísticos resultantes, sin olvidar nunca del inmenso [Datasaurus](https://www.autodeskresearch.com/publications/samestats).
+
+**Preguntas**:
+
+-   ¿Qué significa que una variable numérica tenga solo 5 valores distintos?
+
+-   ¿Es útil una variable categórica con 120 valores distintos?
+
+-   ¿Cómo son las variables fechas?
+
+-   ¿Cómo supone que van a afectar los valores ausentes?
+
+-   ¿Todos los valores ausentes tienen el mismo significado?
+
+-   ¿Cómo imputaría los valores ausentes?
+
+Veamos la distribución de una variable, tomando una cualquiera.
+
+```{r}
+
+ggplot(ds, aes(y=mcomisiones_mantenimiento)) + geom_boxplot()
+
+```
+
+**Preguntas:**
+
+-   ¿Es un *boxplot* de los que está acostumbrado a ver?
+
+-   ¿Qué son los puntos negros?
+
+-   ¿Estas características pueden afectar a la elección del algoritmo para armar el modelo?
+
+La distribución anterior contempla sólo los valores de la variable. ¿Y si empezamos a ver como se comportan los estadísticos según la clase?
+
+Veamos las distribuciones de las clases con respecto a esta variable:
+
+```{r}
+
+ggplot(ds, aes(x=mcomisiones_mantenimiento)) +
+  facet_grid(clase_ternaria ~ .) +
+  geom_density()
+
+```
+
+¿Conclusiones?
+
+::: {.tarea}
+**TAREA**
+
+Aplique un análisis similar para otras variables numéricas que usted considere relevantes.
+:::
+
+Pasemos ahora a una variable que podemos *suponer* que puede ser categórica. Tomemos `Visa_status`, aunque quizás sea más ordinal que categórica (esta no la elegimos ya desde un criterio no tan aleatorio).
+
+```{r}
+
+ds_visa_estado <- dcast(ds, Visa_status  ~ clase_ternaria, 
+                        length, 
+                        value.var = "clase_ternaria" )
+
+ds_visa_estado
+
+```
+
+Vamos a ver empezar a ver de forma binaria la clase objetivo, nos va a ayudar a dar una idea de la potencia discriminante que tiene esta variable.
+
+```{r}
+ds_visa_estado[, total := (`BAJA+1`+`BAJA+2`+CONTINUA)]
+ds_visa_estado[, ratio_baja2 := `BAJA+2` / total]
+ds_visa_estado[, Visa_status := factor(Visa_status)]
+
+ds_visa_estado
+```
+
+Para tener una visión completa, graficamos la cantidad de clientes en cada una de la categorías de `Visa_status`
+
+```{r}
+ggplot(ds_visa_estado, aes(x=Visa_status, y=total)) +
+  geom_bar(stat="identity", fill="blue") + 
+  ggtitle("Cantidad de clientes por categoría de Visa_status")
+```
+
+Y para ver la fuerza de la variable en cada categoría, vemos el ratio de `BAJAS+2` que tiene cada una.
+
+```{r}
+
+ggplot(ds_visa_estado, aes(x=Visa_status, y=ratio_baja2)) +
+  geom_bar(stat="identity", fill="green") +  geom_hline(yintercept = churn, color="black") + 
+  ggtitle("Ratio de churn por categoría de Visa_status")
+
+
+```
+
+Sumemos el **lift** para entender cuanto mejora una categoría de la variable `Visa_status` a la clase de forma numérica
+
+```{r}
+
+ds_visa_estado[, lift := (ratio_baja2 / churn)]
+
+ds_visa_estado
+```
+
+Evaluemos la ganancia de cada una de las categorías para `Visa_status`
+
+```{r}
+
+ds_visa_estado[, Ganancia :=  48750 * `BAJA+2` - 1250 * (CONTINUA + `BAJA+1`) ]
+ds_visa_estado
+
+```
+
+Y calculemos la ganancia total, si son quedamos sólo con los que nos "*da de comer*"
+
+```{r}
+
+cat("Ganancia =",ds_visa_estado[Ganancia > 0, sum(Ganancia)])
+
+```
+
+¡Hemos encontrado un regla que nos hace ganar un montón de plata! Sin algoritmos complejos, sólo con exploración simple y dura. Tal como lo haría ~~su enemigo~~ un analista de negocios.
+
+::: {.tarea}
+**TAREA**
+
+De forma similar a `Visa_status`, analice y combine con la variable `Master_status`. ¿Logra una mejor regla cuando están combinadas?
+:::
+
+Vamos por un análisis más.
+
+Un **analista de negocio** pensará que una de las variables más fuertes es el nivel de actividad de una cuenta. Observa que hay una variable llamada `ctrx_quarter` que refleja la cantidad de movimientos que el cliente realizó en los últimos 90 días. Ayudemos al **analista** a validar su hipótesis.
+
+```{r}
+s$ctrx_quarter
+```
+
+Vemos que tiene una fuerte asimetría, estudiemos solamente a la gente con pocos movimientos.
+
+```{r}
+
+ds_movimientos <- dcast(ds, ctrx_quarter  ~ clase_ternaria, 
+                        length, 
+                        subset = .(ctrx_quarter < 10),
+                        value.var = "clase_ternaria" )
+
+ds_movimientos[, total := (`BAJA+1`+`BAJA+2`+CONTINUA)]
+ds_movimientos[, Ganancia :=  48750 * `BAJA+2` - 1250 * (CONTINUA + `BAJA+1`) ]
+
+ds_movimientos
+```
+
+El olfato del **analista** es correcto.
+
+::: {.tarea}
+**TAREA para ZULIP**
+
+Meta la manos en el barro y analice las variables, navegue los datos. Haga preguntas y respóndalas, no tiene que ser necesariamente en relación a la variable objetivo.
+
+Mientra más conozca los datos, mejor le irá y **más fácil será comunicar los resultados a sus pares de negocio.**
+
+Comparta sus hallazgos **zulip**, en `#clasesAlejandro > EDA`
+:::
+
+**Una ayuda**
+
+Una forma de saber cuales son las variables que merecen nuestra atención, es realizar un modelo y consultar por cuales son pare este, las más importantes. Sin entrar en mucho detalle, hagamos un árbol de decisión y obtengamos un listado de variables para explorar. *Recuerde* que la mejor variable en un árbol, no es necesariamente la mejor variable individual.
+
+```{r}
+library(rpart)
+
+modelo <- rpart( clase_ternaria ~ ., data = ds, cp=0.0005, xval=0 )
+
+as.data.frame(modelo$variable.importance)
+```
+
+::: {.tarea}
+**TAREA AVANZADA Y OPCIONAL**
+
+Lo visto es muy útil para las variables de pocas clases. Para variables numéricas es inaccesible esta de forma de hacer reglas. Arme una función que busque para una variable numérica el mejor punto de corte, esto es, que corte la variable en dos partes, dejando en una de las partes la mayor ganancia posible.
+:::

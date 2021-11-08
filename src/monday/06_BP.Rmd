@@ -1,0 +1,392 @@
+---
+title: "Breakpoint"
+date: "2021-09-27"
+version: 0.7
+output: 
+  html_document:
+    theme: spacelab
+    highlight: monochrome
+    df_print: paged
+#    toc: true
+#    toc_depth: 2
+vignette: >
+  %\VignetteEncoding{UTF-8}
+  %\VignetteEngine{knitr::rmarkdown}
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+> If you want the ultimate, you've got to be willing to pay the ultimate price.
+> It's not tragic to die doing what you love.
+> --- Bodhi, Break Point
+
+En la clase se van a ver temas más avanzados, los alumnos deberán evaluar si deciden aplicar estás técnicas en esta primera competencia, pero sin lugar a dudas deberán aplicarlas en la segunda.
+
+Empecemos con algo que quedo en el tintero de la clase anterior, y que está conectado con la última parte de la clase.
+
+En el enorme espacio de la creación de **feature engineering**, hay algoritmos para la creación de nuevos **features automáticos**.
+
+Una *empresita* llamada *Facebook* publicó hace unos años el paper:
+
+[Practical Lessons from Predicting Clicks on Ads at Facebook](https://research.fb.com/publications/practical-lessons-from-predicting-clicks-on-ads-at-facebook/)
+
+Donde plantea que utilizar los *leaves* de los árboles como nuevas variables.
+Los gigantes de `xgboost` lo implementaron en su librería.
+
+Veamos como funciona, incluso usando `lightgbm` como algoritmo.
+
+```{r}
+rm( list=ls() )
+gc()
+
+```
+
+```{r}
+
+library("data.table")
+library("lightgbm")
+
+carpeta_datasetsOri <-  "../../../datasetsOri/"
+septiembre <- "paquete_premium_202009.csv"
+
+
+ds <- fread(paste0(carpeta_datasetsOri, septiembre,collapse = ""), showProgress = FALSE)
+clase_binaria <- ifelse(ds$clase_ternaria == "BAJA+2", 1, 0)
+ds$clase_ternaria <- NULL
+
+```
+
+Lo primero que tenemos que hacer es armar un modelo.
+
+```{r}
+
+library(xgboost)
+
+dtrain <- xgb.DMatrix(data=data.matrix(ds), label=  clase_binaria, missing=NA)
+param_fe <- list(max_depth=2, eta=1, silent=1, objective='binary:logistic')
+nrounds = 5
+
+bst = xgb.train(params = param_fe, data = dtrain, nrounds = nrounds)
+
+```
+
+Luego se generan las *features* extras
+
+```{r}
+
+new.features.train <- xgb.create.features(model = bst, data.matrix(ds))
+colnames(new.features.train)[150:173]
+
+```
+
+Y podemos visualizar los árboles de nuestro ensamble generador de *features* para entender la composición de las nuevas variables
+
+```{r}
+xgb.plot.tree(colnames(new.features.train), bst,trees = 0)
+```
+
+Podemos entrenar usando en un **lightgbm** sin muchos problemas
+
+```{r}
+
+dtrain_lgb  <- lgb.Dataset( data= data.matrix(new.features.train), label= clase_binaria )
+
+params_gbdt <- list( objective= "binary", max_bin= 15, min_data_in_leaf= 4000, learning_rate= 0.05 )
+
+mlgb <- lgb.train(dtrain_lgb, params = params_gbdt, verbose = -1)
+
+```
+
+Y podemos ver cuál es la importancia de variables
+
+```{r}
+lgb.importance(mlgb)
+
+```
+
+O sea, [para esta parametrización]{.ul}, suma variables de importantes.
+
+**Pregunta**
+
+-   ¿Significa esto que va a dar mejor este conjunto de datos?
+
+-   ¿Sería necesario buscar nuevos hiperparámetros para nuestro **lgbm**?
+    ¿ y para nuestro **xgb** que genera los *features*?
+
+-   ¿Cómo podría implementar un **pipeline** para incorporar este tipo de variables o variables similares?
+
+Dejemos en suspenso este punto.
+Volveremos en un rato con una visión más general.
+
+Tiempo atrás se calculó que la probabilidad, algo que se veía claramente en la práctica en los árboles de decisión.
+
+Validemos si ocurre lo mismo en un nuestros algoritmos.
+
+Vamos a apoyarnos en una función que busque para todos los puntos de corte, el que más ganancia genera.
+
+```{r}
+ganancia  <- function(score, clases, cp= 0.025, prop=1){
+  return( sum( (score > cp  )*ifelse( clases== 1, 48750, -1250 ) ) / prop )
+}
+
+mejorpuntocorte <- function(score, clases, prop=1) {
+  
+  tmp <- data.table(score, clases)
+
+  tmp[, v := ifelse(clases == 1, 48750,-1250)]
+  tmp2 <- tmp[, .(gan = sum(v)), by = score]
+  tmp2 <- tmp2[order(-score)]
+  tmp2[, ganancia := cumsum(gan)]
+  tmp2[, ganancia := ganancia / prop] 
+  maxganancia <- tmp2[max(ganancia) == ganancia, ganancia]
+  puntocorte <- tmp2[max(ganancia) == ganancia, score]
+  list(gan=maxganancia, cp=puntocorte)
+}
+
+```
+
+Y buscamos en **train** cuál es el mejor punto de corte
+
+```{r}
+
+dtrain_lgb  <- lgb.Dataset( data= data.matrix(ds), label= clase_binaria )
+mlgb <- lgb.train(dtrain_lgb, params = params_gbdt, verbose = -1)
+probs <- predict(mlgb, data.matrix(ds))
+mejorpuntocorte(probs, clase_binaria)$cp
+```
+
+Podemos pensar que entre el punto el mejor punto de corte y nuestro punto de corte teórico no hay valores existentes, como sucedía con los árboles.
+
+```{r}
+head(probs[probs > 0.021 & probs < 0.025])
+tail(probs[probs > 0.021 & probs < 0.025])
+```
+
+Vemos que el mejor punto de corte no es necesariamente el teórico.
+
+**Pregunta**
+
+-   ¿Por qué sucede esto?
+
+Luego tendríamos que ver como podemos buscar el punto de corte.
+Una opción es con **CV**
+
+```{r}
+folds <- splitTools::create_folds(clase_binaria, k = 5, seed = 17)
+res <- data.table()
+
+# Vamos a almacenar todos los scores de validación
+validation <- numeric(length(clase_binaria))
+
+for (f in folds) {
+  ds_train  <- lgb.Dataset( data=  data.matrix(ds[f]), label= clase_binaria[f] )
+  m <- lgb.train(ds_train, params = params_gbdt, verbose = -1)
+  validation[-f] <- predict(m,data.matrix(ds[-f]))
+  res <- rbindlist(list(res, mejorpuntocorte(validation[-f], clase_binaria[-f], 0.2)))
+}
+
+```
+
+```{r}
+res
+```
+
+**Pregunta**
+
+-   ¿Cómo podríamos determinar un mejor punto de corte con este resultado?
+
+Veamos una forma, promediando los mejores puntos
+
+```{r}
+mean(res$cp)
+```
+
+Veamos con los datos de validation cuál es el mejor punto de corte
+
+```{r}
+ganancia(validation, clase_binaria)
+ganancia(validation, clase_binaria, mean(res$cp))
+```
+
+Otra recomendación, es incluir el punto de corte como un parámetro más dentro de una optimización bayesiana.
+
+También podemos buscar el mejor corte posible sobre el conjunto compuesto por todos los scores obtenidos en los *folds* de validación
+
+```{r}
+mejorpuntocorte(validation, clase_binaria)
+```
+
+Sigamos este análisis sobre otros tipos de modelos que pueden ser creados usando el **mágico lightgbm.**
+
+Se puede implementar un "**random forest"**
+
+```{r}
+params_rf <- list(objective = "binary",  boosting_type = "rf", bagging_freq = 1, bagging_fraction = 0.66, feature_fraction = 0.4)
+
+```
+
+Y también los creadores de **lightgbm** crearon una forma distinta de construir los **GBDT**
+
+[LightGBM: A Highly Efficient Gradient Boosting Decision Tree](https://proceedings.neurips.cc/paper/2017/file/6449f44a102fde848669bdd9eb6b76fa-Paper.pdf)
+
+Que promete ser veloz en el ajuste, a cambio de una baja en la performance
+
+```{r}
+
+params_goss <- list(objective = "binary", learning_rate = 0.05, top_rate = 0.5, other_rate = 0.1, feature_fraction_bynode = 0.2, boosting_type = "goss")
+
+```
+
+Hay un tipo más, los **dart**, que prometen más precisión a un mayor tiempo de entrenamiento, pero los vamos a dejar de lado.
+
+**IMPORTANTE**: No hice búsqueda bayesiana en **goss**, ni en **rf**.
+
+Armamos nuestro propio GBDT CV, para poder personalizar su funcionamiento.
+
+```{r}
+
+# OJO! Con esta función perdemos cuál es la mejor iteración. 
+
+mylgbcv <- function(data, target, params, nfold, seed) {
+  
+  folds <- splitTools::create_folds(target, k = nfold, seed = seed)
+  res <- data.table()
+  validation <- numeric(length(target))
+  for (f in folds) {
+    ds_train  <- lgb.Dataset( data=  data.matrix(data[f]), label= target[f] )
+    m <- lgb.train(ds_train, params = params, verbose = -1)
+    validation[-f] <- predict(m,data.matrix(data[-f]))
+    res <- rbindlist(list(res, mejorpuntocorte(validation[-f], target[-f], 0.2)))    
+  }
+  list(probs= validation, gan= ganancia(validation, target), bcp = mejorpuntocorte(validation, target), res=res)
+}
+
+```
+
+Y ejecutamos las diferentes opciones para compararlas
+
+```{r}
+gbdt <- mylgbcv(ds, clase_binaria, param= params_gbdt, 5, 17)
+rf <- mylgbcv(ds, clase_binaria, param= params_rf, 5, 17)
+goss <- mylgbcv(ds, clase_binaria, param= params_goss, 5, 17)
+```
+
+Revisemos los resultados
+
+```{r}
+gbdt$gan
+print("mejor punto de corte según cv")
+ganancia(gbdt$probs, clase_binaria, mean(gbdt$res$cp))
+print("mejor punto de corte")
+gbdt$bcp
+```
+
+```{r}
+
+rf$gan
+print("mejor punto de corte según cv")
+ganancia(rf$probs, clase_binaria, mean(rf$res$cp))
+print("mejor punto de corte")
+rf$bcp
+```
+
+```{r}
+goss$gan
+print("mejor punto de corte según cv")
+ganancia(goss$probs, clase_binaria, mean(goss$res$cp))
+print("mejor punto de corte")
+goss$bcp
+```
+
+Vemos que tienen puntos de cortes distintos.
+
+Veamos que tan distintas son las distribuciones para ver si lo único que cambian es el punto de corte.
+
+```{r}
+library(ggplot2)
+d = data.table(rf=rf$probs,gbdt=gbdt$probs,goss=goss$probs)
+ggplot(melt(d), aes(x=value )) + 
+  facet_grid(variable ~ .) +  
+  geom_histogram(bins = 15)
+```
+
+No pareciera que vaya grandes diferencias en las distribuciones.
+Comparemos una a una
+
+```{r}
+ggplot(d, aes(goss,gbdt)) + 
+  geom_bin2d() + 
+  geom_hline(yintercept = mean(gbdt$res$cp)) + 
+  geom_vline(xintercept = mean(goss$res$cp)) 
+ggplot(d, aes(rf,gbdt)) + 
+  geom_bin2d() + 
+  geom_hline(yintercept = mean(gbdt$res$cp)) + 
+  geom_vline(xintercept = mean(rf$res$cp)) 
+ggplot(d, aes(goss,rf)) + 
+  geom_bin2d() + 
+  geom_hline(yintercept = mean(rf$res$cp)) + 
+  geom_vline(xintercept = mean(goss$res$cp))  
+
+```
+
+**Eureka!** Buscando una relación entre los puntos de corte, encontramos que no todos los modelos están mandando a los mismos clientes!
+
+Empezamos a entender que quizás debamos combinarlos, para tratar de ganar un poco más de performance.
+
+Alguna formas simples de combinarlos son
+
+-   Si la mayoría de los modelos deciden que un elemento es `BAJA+2`, se debe enviar
+
+-   Si alguno de los modelos decide que un elemento es `BAJA+2` , se debe enviar
+
+-   Si tenemos *M* modelos, si tenemos *N* modelos, con *N \< M,* que deciden que un elemento es `BAJA+2` *,* entonces se debe enviar.
+
+**Pregunta**
+
+-   ¿Cómo podemos determinar el valor de N del punto anterior?
+
+Otra importante observación, es que los modelos ordenan a los clientes, dejando a los clientes con un score más altos con una mayor probabilidad de que sean `BAJA+2` que los que tienen un score más bajo.
+
+> Para los modelos, no todos los clientes son iguales
+
+Analicemos los clientes que envía el **rf,** son en total
+
+```{r}
+sum(rf$probs > mean(rf$res$cp))
+```
+
+Y como es la distribución de `BAJAS+2` y `!BAJA+2`en los envíos
+
+```{r}
+library(dplyr)
+i <- rf$probs > mean(rf$res$cp)
+d2 <- data.table(probs = rf$probs[i], q = ntile(rf$probs[i], 10), clase_binaria = clase_binaria[i])
+d3 <- dcast(d2, q ~ clase_binaria, 
+          length, 
+          value.var = "clase_binaria" )
+
+d3[, ratio:= `1` / `0`]
+d3[, lift:= ratio / (sum(clase_binaria) / length(clase_binaria)) ]
+d3[order(-q)]
+```
+
+Vemos que los clientes con **score** más alto, tiene un lift 3 veces mayor que los que envía con score más bajo.
+
+Esto nos hace pensar que desaprovechar la información de los scores podría estar cerca del pecado.
+
+Pero ¿Cómo aprovechamos esa información?
+¿Qué técnica conocemos que relaciona de forma inteligente una variable (el score es una variable) con un target?
+
+Exacto!
+los modelos de machine learning!
+podemos relacionar los scores productos de modelos, con un nuevo modelo que seleccione en cada caso la mejor combinación.
+
+Ensamblar resultados de modelos con otro modelo se llama **model stacking**, el modelo ensamblador se suele llamar meta-modelo.
+
+Podemos ir un paso más, y al meta-modelo no solo darles los scores de los modelos, sino todas las variables... esto tiene aroma a lo que vimos al principio de la clase...
+
+Pero no todo lo que brilla es oro, hay que tener cuidado de overfittear, es algo muy común cuando uno hace stacking.
+
+Para los que decidan avanzar desde ahora en esta jungla, la idea fundamental detrás de esta estrategia, es que el entrenamiento del meta-modelo, se haga con datos de test/validation y no sobre el score del modelo de **train**.
+Se pueden utilizar para este fin, las funciones de **CV** que se incluyen en esta notebook.

@@ -1,0 +1,564 @@
+---
+title: "Hiper Parametrización"
+
+date: "2021-09-05"
+version: 0.7
+output: 
+  html_document:
+    theme: spacelab
+    highlight: monochrome
+    df_print: paged
+#    toc: true
+#    toc_depth: 2
+
+vignette: >
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{css, echo=FALSE}
+.tarea {
+  padding: 1em;
+  border: 2px solid red;
+  border-radius: 10px;
+  margin-bottom: 10px;
+}
+
+```
+
+```{r}
+rm( list=ls() )
+gc(verbose = FALSE)
+```
+
+> ... premature optimization is the root of all evil
+>
+> --- Donald Knuth
+
+> Success is a lousy teacher. It seduces smart people into thinking they can't lose.\
+> --- Bill Gates
+
+Hoy nos empaparemos con detalles de la búsqueda del mejor modelo. Un mismo algoritmo puede generar múltiples modelos en función de los datos que se le pude ajustar, y los parámetros que lo configuran.
+
+**Pregunta**
+
+-   ¿Cuál es el fin de buscar el mejor modelo?
+
+Antes de empezar nuestra búsqueda tenemos que tener presenta que nada en la vida es gratis. En nuestro caso, nuestra inversión es el **tiempo** de ejecución y en un futuro, las monedas del costo de la nube, que se descuenta del crédito gratuito que da *GCP*.
+
+Este problema esta muy presente un muchas áreas de la ciencia de datos y, en muchas otras, y suele considerarse como el **trade-off** entre **Exploration/Exploitation**.
+
+**Pregunta**
+
+-   ¿Dónde lo buscamos el mejor modelo?
+
+Continuaremos usando como algoritmo de ajuste el **decision tree**. Los parámetros del árbol, son en esencia, distintas formas de *podar* el árbol. Para nuestros experimentos trabajaremos sólo con `maxdepth` y `minsplit` .
+
+Leemos cuál es la función de cada parámetros:
+
+-   `minsplit`**:** The minimum number of observations that must exist in a node in order for a split to be attempted
+
+-   `maxdepth`**:** Set the maximum depth of any node of the final tree, with the root node counted as depth 0. Values greater than 30 rpart will give nonsense results on 32-bit machines.
+
+Podemos considerar que `maxdepth` varíe entre 4 a 30, en nuestras *PC* actuales no tienen el problema que hacen referencia, sin embargo nos parece un buen límite.
+
+Para `minsplit` es más complejo determinar un límite. Podemos partir de 2 y llegar hasta 200.
+
+**Pregunta**
+
+-   ¿Qué otros parámetros conoce para un árbol de decisión?
+
+-   ¿Qué espacios de búsqueda tienen esos parámetros?
+
+**Ejercicio Mental**
+
+-   ¿Cómo se imagina la interacción entre esto dos parámetros?
+
+$$\\[3in]$$
+
+Para estar seguro de obtener el mejor modelo para esos 2 parámetros, una *opción* podría ser probar todas las posibles combinaciones.
+
+Veamos cuanto tiempo necesitaríamos
+
+```{r}
+n_md = 30 - 4
+n_ms = 200 - 2
+n_seeds = 5
+avg_time_per_tree = 10 # in sec
+
+library(lubridate)
+
+seconds_to_period(n_md * n_ms * n_seeds * avg_time_per_tree )
+
+```
+
+```{r}
+
+seconds_to_period(n_md * n_ms * n_seeds * avg_time_per_tree )
+
+```
+
+**2 días** para buscar una combinación de 2 parámetros!. Entendemos que si tuviéramos un parámetro adicional, con 10 posibles valores ya estamos en 200 días.
+
+Y en caso que estamos frente a parámetro con **valores continuos**, estaríamos en graves problemas.
+
+Al ser imposible probar todo, nos queda pensar en distintas estrategias de búsqueda, aspirando a encontrar el mejor modelo posible sin probar todo, pero conformándonos con tan sólo un mejor modelo del que tenemos por *default*.
+
+Si estamos realmente a ciegas donde buscar, lo mejor es dejar que la suerte haga su trabajo.
+
+Hablemos un poco de eso, mire los siguientes dos gráficos:
+
+```{r}
+library(lhs)
+
+set.seed(17)
+A <- matrix(runif(20), 10, 2)
+B <- optimumLHS(10, 2)
+
+par(mfrow=c(1,2))
+plot(A)
+plot(B)
+```
+
+Las dos gráficas son muestras aleatorias, pero que distingue la **B** de la **A**?
+
+La segunda se llama muestro por Latin hypercube (LH), que consiste en buscar una muestra aleatoria, que que cubra la mayor cantidad de opciones en cada una de las variables correspondientes, nos podemos dar una idea con la siguiente imagen:
+
+![](img/03_lhs.png){width="400"}
+
+Este tipo de muestreo esta pensado justamente para diseñar experimentos, donde los costos de cada uno son altos.
+
+Probemos buscar el mejor modelo partiendo de muestras aleatorias LH.
+
+Cargamos los datos
+
+```{r}
+
+library( "data.table")
+library("ggplot2")
+
+carpeta_datasetsOri <-  "../../../datasetsOri/"
+septiembre <- "paquete_premium_202009.csv"
+
+ds <- fread(paste0(carpeta_datasetsOri, septiembre,collapse = ""), header=TRUE, showProgress = FALSE)
+
+# Usaremos la clase binaria, ya somos niños grandes.
+ds[, clase_binaria := ifelse(clase_ternaria == "BAJA+2", "evento", "noevento")]
+ds[, c("clase_ternaria") := NULL]
+
+# Solo usaremos 5
+semillas <- as.vector(unlist(fread("cache/02_DT_semillas.txt")))[1:5]
+```
+
+Para mayor comodidad, armamos hacemos de algunas funciones.
+
+Trabajaremos con nuestro ya querido (sólo hasta hoy) `rpart`. Y vamos a analizar nuestro mejor modelo utilizando `auc`. El motivo por el cuál ahora no utilizaremos la ganancia quedará claro en unos momentos.
+
+```{r}
+library(rpart)
+
+modelo_rpart <- function (train, test, cp =  0, ms = 20, mb = 1, md = 30) { 
+  
+    modelo <- rpart(clase_binaria ~ ., data = train, 
+                    xval=0, 
+                    cp=cp, 
+                    minsplit=ms, 
+                    minbucket=mb, 
+                    maxdepth = md )
+    
+    test_prediccion <- predict(modelo, test , type = "prob")
+    roc_pred <-  ROCR::prediction(test_prediccion[,"evento"], test$clase_binaria,
+                                  label.ordering=c("noevento", "evento"))
+    auc_t <-  ROCR::performance( roc_pred,"auc")
+
+    unlist(auc_t@y.values)
+}
+```
+
+Y vamos a trabajar con una muestra para entrenar, tan solo para acortar los tiempos de procesamiento.
+
+**Repito, sólo para realizar las pruebas más rápido**
+
+En nuestro muestreo vamos a **undersamplear** la clase **noevento**, dejando todos los clase `BAJA+2`.
+
+```{r}
+
+tomar_muestra <- function(datos, resto=10000 ) {
+      t <- datos$clase_binaria == "evento"
+      r <- rep(FALSE, length(datos$clase_binaria))
+      r[!t][sample.int(resto,n=(length(t)-sum(t)))] <- TRUE
+      t | r
+}
+
+ds_sample <- tomar_muestra(ds)
+table(ds[ds_sample]$clase_binaria)
+```
+
+Probamos para ver la mejora en tiempos y comparar los métricas resultantes
+
+```{r}
+
+set.seed( semillas[1] )
+inTraining <- caret::createDataPartition(ds$clase_binaria, p = 0.70, list = FALSE)
+train  <-  ds[  inTraining, ]
+test   <-  ds[ -inTraining, ]
+train_sample <- tomar_muestra(train)
+
+t0 <- Sys.time()
+r1 <- modelo_rpart(train, test)
+t1 <- Sys.time()
+print(t1-t0)
+
+t0 <- Sys.time()
+r2 <- modelo_rpart(train[train_sample,], test)
+t1 <- Sys.time()
+print(t1-t0)
+
+print(r1)
+print(r2)
+```
+
+**Pregunta**
+
+-   Si el alumno quiere seguir ejecutar los siguientes experimentos con la **ganancia**. ¿Qué consideraciones tiene que tener?
+
+Construimos una última función auxiliar para ejecutar todas las semillas a la vez
+
+```{r}
+experimento_rpart <- function (ds, semillas, cp =  0, ms = 20, mb = 1, md = 30) {
+  auc <- c()
+  for (s in semillas) {
+    set.seed(s)
+    inTraining <- caret::createDataPartition(ds$clase_binaria, p = 0.70, list = FALSE)
+    train  <-  ds[  inTraining, ]
+    test   <-  ds[ -inTraining, ]
+    train_sample <- tomar_muestra(train)
+    r <- modelo_rpart(train[train_sample,], test,  cp = cp, ms = ms, mb = mb, md = md)
+    auc <- c(auc, r)
+  }
+  data.table(mean_auc = mean(auc), sd_auc = sd(auc))
+}
+```
+
+```{r}
+experimento_rpart(ds, semillas)
+```
+
+Haremos 25 experimentos aleatorios, armamos las muestras de acuerdo a como son las entradas de nuestro experimento.
+
+```{r}
+set.seed(semillas[1])
+S <- optimumLHS(25,2)
+
+# la primera columna es para el maxdepth, y la segunda para el minslip
+S[,1] <- floor(26*S[,1]) + 4
+S[,2] <- floor(198*S[,2]) + 2
+
+```
+
+Y ejecutamos nuestro experimento
+
+```{r, eval=FALSE}
+
+resultados_random_search <- data.table()
+for (e in 1:25) {
+  r <- experimento_rpart(ds, semillas, ms = S[e,2], md = S[e,1])
+  resultados_random_search <- rbindlist( list(resultados_random_search,
+                  data.table(md = S[e,1], ms= S[e,2],r)
+  ))
+}
+
+fwrite(resultados_random_search,"cache/03_HO_random_search.csv")
+```
+
+```{r}
+
+resultados_random_search <- fread("cache/03_HO_random_search.csv")
+
+```
+
+Revisemos los resultados y busquemos el óptimo
+
+```{r}
+resultados_random_search
+```
+
+Y llevemos a un simple visualización (filtrando los casos más bajos).
+
+```{r}
+ggplot(resultados_random_search[mean_auc > 0.80,], aes(x=md,y=ms,color=sd_auc)) +
+    scale_color_gradient(  low = "blue", high = "red") +
+    geom_point(aes(size = mean_auc))
+```
+
+**Preguntas**
+
+-   ¿Hay alguna zona dónde parece que hay más ganancia?
+
+-   ¿Cómo podemos continuar nuestra búsqueda?
+
+-   ¿Por qué cree que no se mencionó hasta ahora el `Grid Search`?
+
+::: {.tarea}
+**TAREA (¿en clase?)**
+
+Desarrolle un experimento similar, de 25 ejecuciones, cubriendo los mismos espacios de búsqueda utilizando un `Grid Search`
+:::
+
+**Break time**
+
+$$\\[3in]$$
+
+Luego de disparar tiros al aire, vamos a ver que hay formas más inteligentes de buscar nuestros modelos. Una de ellas es la **búsqueda bayesiana**. Para esta, vamos a utilizar la librería `mlrMBO`, que nos da muchas opciones.
+
+Entendamos de que trata esta estrategia a través de un ejemplo:
+
+```{r}
+library(DiceKriging)
+library(mlrMBO)
+
+set.seed(17)
+```
+
+Lo primero que tenemos que hacer, es definir una **función objetivo** sobre la que vamos a hacer la búsqueda. Para este caso de ejemplo, usaremos la función seno. Se define a la par, los parámetros sobre los que se va a realizar la búsqueda: **x**, y el espacio de búsqueda: **[3, 13]**.
+
+También le definimos con el parámetro `global.opt.value` que busque un máximo, sino por defecto, buscará un mínimo.
+
+```{r}
+obj.fun = makeSingleObjectiveFunction(
+  name = "Sine",
+  fn = function(x) sin(x), 
+  par.set = makeNumericParamSet(lower = 3, upper = 13, len = 1)
+)
+```
+
+Luego empezamos a configurar como va a ser nuestra búsqueda.
+
+```{r}
+ctrl = makeMBOControl()
+```
+
+Definimos que vamos a realizar sólo 10 iteraciones.
+
+```{r}
+ctrl = setMBOControlTermination(ctrl, iters = 10L)
+```
+
+Definimos en función de nuestro objetivo de que forma en que se va a ir realizando la búsqueda.En nuestro caso, le estamos diciendo que estamos buscando solamente encontrar el optimo, no nos interesa el resto del espacio, y que a cada paso esperamos acercarnos cada vez más.
+
+```{r}
+ctrl = setMBOControlInfill(ctrl, crit = makeMBOInfillCritEI(),
+                           opt = "focussearch")
+
+lrn = makeMBOLearner(ctrl, obj.fun)
+```
+
+Para empezar a buscar necesita una base de puntos, estos mismos los vamos a generar de forma aleatoria, y vamos a generar tan solo 6.
+
+```{r}
+design = generateDesign(6L, getParamSet(obj.fun), fun = lhs::maximinLHS)
+
+```
+
+Y simplemente ejecutamos nuestro experimento con todos los parámetros configurados
+
+```{r}
+run = exampleRun(obj.fun, design = design, learner = lrn,
+                 control = ctrl, points.per.dim = 100, show.info = TRUE)
+```
+
+Y vamos a ejecutar una visualización que nos de luz a lo que hizo nuestra optimización paso a paso.
+
+```{r}
+plotExampleRun(run, densregion = TRUE, gg.objects = list(theme_bw()), pause = FALSE)
+
+```
+
+A continuación, un ejemplo pero con dos variables.
+
+```{r eval=FALSE}
+
+set.seed(1)
+configureMlr(show.learner.output = FALSE)
+
+obj.fun = makeBraninFunction()
+
+ctrl = makeMBOControl(propose.points = 1L)
+ctrl = setMBOControlTermination(ctrl, iters = 10L)
+ctrl = setMBOControlInfill(ctrl, crit = makeMBOInfillCritEI(),
+                           opt = "focussearch", opt.focussearch.points = 20L)
+
+lrn = makeMBOLearner(ctrl, obj.fun)
+design = generateDesign(10L, getParamSet(obj.fun), fun = lhs::maximinLHS)
+
+run = exampleRun(obj.fun, design = design, learner = lrn, control = ctrl,
+                 points.per.dim = 50L, show.info = TRUE)
+
+print(run)
+
+plotExampleRun(run, gg.objects = list(theme_bw()), pause = FALSE)
+
+```
+
+::: {.tarea}
+**TAREA**
+
+Ejecute la celda anterior e interprete el paso a paso.
+:::
+
+Vamos a analizar de una forma similar nuestra objetivo, primero explorando el parámetro `maxdepth`, recorriendo todos los posibles valores "a la" `grid search`, para entender en que escenario nos encontramos.
+
+```{r, eval=FALSE}
+
+
+resultados_maxdepth <- data.table()
+
+for (v in 4:30) {
+    r <- data.table(
+      md = v,
+      experimento_rpart(ds, semillas, md= v, ms=40)
+    )
+    resultados_maxdepth <- rbindlist(list(resultados_maxdepth, r))
+}
+
+fwrite(resultados_maxdepth,"cache/03_HO_md.csv")
+
+
+```
+
+Y hacemos lo que más nos (me) gusta, hacer dibujos:
+
+```{r}
+
+resultados_maxdepth <- fread("cache/03_HO_md.csv")
+
+ggplot(resultados_maxdepth, aes(md,mean_auc))  + 
+  geom_point()
+
+```
+
+Buscamos el punto máximo:
+
+```{r}
+max(resultados_maxdepth$mean_auc)
+resultados_maxdepth[mean_auc == max(mean_auc), md]
+
+```
+
+Aún así el máximo que nos ofrece nos convence (gráficamente). Para el resultado anterior tuvimos que calcular 25 puntos, veamos si **BO** nos ayuda.
+
+Cómo **BO** busca mínimo, devolveremos nuestra `auc` negativo. Configuramos nuestra función objetivo
+
+```{r, eval= FALSE}
+
+obj.fun = makeSingleObjectiveFunction(
+  name = "max depth",
+  fn = function(x) - experimento_rpart(ds, semillas, md= as.integer(x))$mean_auc,
+  par.set = makeNumericParamSet("maxdepth", lower=4L , upper=  30L),
+  has.simple.signature = FALSE
+)
+```
+
+Completamos el experimento, haciendo 10 búsquedas, partiendo de 4 elementos.
+
+```{r, eval= FALSE}
+
+ctrl = makeMBOControl()
+ctrl = setMBOControlTermination(ctrl, iters = 10L)
+ctrl = setMBOControlInfill(
+  ctrl,
+  crit = makeMBOInfillCritEI(),
+  opt = "focussearch"
+)
+
+lrn = makeMBOLearner(ctrl, obj.fun)
+design = generateDesign(4L, getParamSet(obj.fun), fun = lhs::maximinLHS)
+
+surr.km <- makeLearner("regr.km", predict.type = "se", covtype = "matern3_2")
+
+
+run = exampleRun(
+  obj.fun,
+  design = design,
+  learner = surr.km,
+  control = ctrl,
+  points.per.dim = 25,
+  show.info = TRUE
+)
+
+saveRDS(run, "cache/03_HO_md_OB.RDS")
+```
+
+```{r}
+run <- readRDS("cache/03_HO_md_OB.RDS")
+plotExampleRun(run, densregion = TRUE, gg.objects = list(theme_bw()), pause=FALSE)
+print(run)
+```
+
+Es muy interesante, no llegó al optimo, pero estuvo muy cerca, utilizando muy pocas iteraciones para un mismo espacio de búsqueda.
+
+Busquemos el óptimo de las dos variables conjuntas que estuvimos viendo, a ver si para la misma cantidad de iteraciones consigue un mejor modelo.
+
+```{r, eval = FALSE }
+
+
+obj_fun <- function(x) { 
+  experimento_rpart(ds, semillas, md= x$maxdepth, ms= x$minsplit)$mean_auc
+}
+
+obj.fun = makeSingleObjectiveFunction(
+  name = "2 parametros",
+  minimize = FALSE,
+  fn = obj_fun,
+  par.set = makeParamSet(
+    makeIntegerParam("maxdepth",  lower = 1L, upper = 25L),
+    makeIntegerParam("minsplit",  lower=2L , upper=  200L)
+  ),
+  has.simple.signature = FALSE
+)
+
+```
+
+Y pasamos a realizar la búsqueda, con 8 puntos iniciales y 17 más para buscar.
+
+```{r, eval = FALSE }
+ctrl = makeMBOControl()
+ctrl = setMBOControlTermination(ctrl, iters = 17L)
+ctrl = setMBOControlInfill(
+  ctrl,
+  crit = makeMBOInfillCritEI(),
+  opt = "focussearch"
+)
+
+#lrn = makeMBOLearner(ctrl, obj.fun)
+design <- generateDesign(8L, getParamSet(obj.fun), fun = lhs::maximinLHS)
+
+surr.km <-
+  makeLearner("regr.km", predict.type = "se", covtype = "matern3_2")
+
+run  <-  mbo(obj.fun, design = design, learner = surr.km, control = ctrl)
+
+
+saveRDS(run, "cache/03_HO_md_ms_OB.RDS")
+
+```
+
+```{r}
+run <- readRDS("cache/03_HO_md_ms_OB.RDS")
+print(run)
+```
+
+Tomemos todas las iteraciones para visualizarlas:
+
+```{r}
+iter <- as.data.frame(run$opt.path)
+iter
+```
+
+```{r}
+
+ggplot(iter, aes(y=minsplit,x=maxdepth, color=prop.type)) + geom_point(aes(size = y))
+
+```
+
+¿Observaciones?

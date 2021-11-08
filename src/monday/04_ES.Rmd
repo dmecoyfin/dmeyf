@@ -1,0 +1,443 @@
+---
+title: "Ensambles: Sofisticando los algoritmos "
+date: "2021-09-13"
+version: 0.7
+output: 
+  html_document:
+    theme: spacelab
+    highlight: monochrome
+    df_print: paged
+#    toc: true
+#    toc_depth: 2
+vignette: >
+  %\VignetteEncoding{UTF-8}
+  %\VignetteEngine{knitr::rmarkdown}
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+```{css, echo=FALSE}
+.tarea {
+  padding: 1em;
+  border: 2px solid red;
+  border-radius: 10px;
+  margin-bottom: 10px;
+}
+```
+
+> Hay quienes pasan por el bosque y sólo ven leña para el fuego
+>
+> --- León Tolstoi
+
+Son muchos los caminos que nos lleva esta materia.Un en particular es una escalera, que busca ir incrementando la performance de nuestros modelos, mejorando con pequeños.
+No todos los peldaños son del mismo tamaño, particularmente el de la clase de hoy, nos elevará como ninguna otra técnica.
+Hablaremos de los algoritmos basados en ensambles.
+
+Pero antes de que nada, un repaso.
+
+**Preguntas**
+
+-   ¿Qué es un ensamble de modelos?
+
+-   ¿Cómo tienen que ser los modelos dentro de un ensamble?
+
+-   ¿Qué técnicas conoce para ensamblar modelos?
+
+-   ¿Por qué funcionan mejor los ensambles?
+
+Los ensambles pueden partir de modelos ya desarrollados, de modelos que se creen especialmente para ser ensamblados.
+
+Hoy pondremos atención a los segundos, sin olvidarnos que durante la cursada, generaremos múltiples modelos que quien nos dice, sean útiles para un *super* ensamble.
+
+El primer tipo de algoritmo que veremos son los de **bagging** (bootstrap aggregating).
+Estos consisten en
+
+-   Hacer **N** nuevos conjunto de entrenamiento usando boostraping, o sea, reemplazar nuestro dataset por elementos aleatorios con reemplazo.
+
+-   Para este cada nuevo dataset obtener un modelo.
+
+-   Promediar las salidas de los modelos.
+
+El espíritu detrás de este algoritmo, puede entenderse en que cada modelo es una especialista de sólo una parte, y la suma de muchos especialistas consiguen un buen modelo.
+
+El algoritmo de **bagging** más conocido es el **random forest** que ustedes ya conocen.
+
+Probemos como funciona un **rf**, en nuestro conjunto de datos.
+
+Primero carguemos todo
+
+```{r}
+
+rm( list=ls() )
+gc(verbose = FALSE)
+```
+
+```{r}
+library( "data.table")
+library("ggplot2")
+
+carpeta_datasetsOri <-  "../../../datasetsOri/"
+septiembre <- "paquete_premium_202009.csv"
+
+ds <- fread(paste0(carpeta_datasetsOri, septiembre,collapse = ""), header=TRUE, showProgress = FALSE)
+ds$clase_binaria <- factor(ifelse(ds$clase_ternaria == "BAJA+2", 1, 0))
+ds$clase_ternaria <- NULL
+
+# Solo usaremos 5
+semillas <- as.vector(unlist(fread("cache/02_DT_semillas.txt")))[1:5]
+```
+
+A la hora de trabajar con este precioso algoritmo necesitamos una librería.
+La gran mayoría son malas, no pueden trabajar con datos ausentes... sí!
+a pesar de trabajar con árboles, no pueden trabajar con datos ausentes...
+
+Pero bueno, aprovechemos esta experiencia al máximo, cerremos los ojos y usemos la librería **ranger**.
+
+```{r}
+
+library(caret)
+library(ranger)
+library(randomForest)
+
+set.seed(semillas[1])
+
+train_casos <- createDataPartition(ds[,get("clase_binaria")], p = 0.7, list = FALSE)
+ds_train  <-  ds[  train_casos, ]
+ds_test   <-  ds[ -train_casos, ]
+
+##
+## ranger no soporta, como lo hacen otras librerías, los missing values
+## 
+ds_train <-  na.roughfix( ds_train )
+ds_test <-  na.roughfix( ds_test )
+
+# Recomendación: 
+variables <- round(sqrt(dim(ds)[2]-1))
+
+t0 <- Sys.time()
+modelo_rf_1 <- ranger( clase_binaria ~ ., data = ds_train, 
+                  probability=TRUE, 
+                  num.trees=100,
+                  min.node.size=10, 
+                  # numero de variables -> RECORDAR CUANDO UNO AGREGA MAS VARIABLES
+                  mtry=variables,
+                  splitrule="gini",
+                  sample.fraction = 0.66,
+                  importance = "impurity",
+                  verbose=TRUE)	
+t1 <- Sys.time()
+tiempo <-  as.numeric(  t1 - t0, units = "secs")
+print(paste0("Tiempo de ajuste Random Forest: " , tiempo, collapse = " "))
+
+```
+
+Revisemos primero la performance del modelo en `train` y `test` sobre la **auc**:
+
+```{r}
+
+library(ROCR)
+
+pred_train <- predict(modelo_rf_1, ds_train)
+pred_test <- predict(modelo_rf_1, ds_test)
+
+roc_pred_test <-  ROCR::prediction(pred_test$predictions[,"1"], ds_test[,"clase_binaria"], label.ordering=c(0, 1))
+auc_t_test <-  ROCR::performance( roc_pred_test,"auc"); 
+auc_test <- unlist(auc_t_test@y.values)
+
+roc_pred_train <-  ROCR::prediction(pred_train$predictions[,"1"], ds_train[,"clase_binaria"], label.ordering=c(0, 1))
+auc_t_train <-  ROCR::performance( roc_pred_train,"auc"); 
+auc_train <- unlist(auc_t_train@y.values)
+  
+print(paste0("train ", auc_train))
+print(paste0("test ", auc_test))
+```
+
+Wow!
+¿Qué paso en `train`?
+
+Veamos a continuación algo muy útil de los \`RF.
+La importancia de variables:
+
+```{r}
+
+importancia <- as.data.table(modelo_rf_1$variable.importance,keep.rownames = TRUE)
+colnames(importancia) <- c("variable", "importancia")
+setorder(importancia, -importancia)
+importancia
+
+```
+
+**Preguntas** \* ¿Qué significa que una variable sea más importante que otra?
+\* ¿Qué significa que una variable tenga 0 importancia?
+¿Con el **RF** es suficiente como para descartarlas?
+\* ¿Qué una variable tenga algo de importancia es suficiente como para entender que da valor?
+
+Hagamos un experimento
+
+```{r}
+set.seed(semillas[2])
+ds_train$canario <- runif(nrow(ds_train))
+
+modelo_rf_2 <- ranger( clase_binaria ~ ., data = ds_train, 
+                  probability=TRUE, 
+                  num.trees=150,
+                  min.node.size=10, 
+                  mtry=variables,
+                  splitrule="gini",
+                  importance = "impurity",
+                  verbose=TRUE)	
+```
+
+```{r}
+
+importancia <- as.data.table(modelo_rf_2$variable.importance,keep.rownames = TRUE)
+colnames(importancia) <- c("variable", "importancia")
+setorder(importancia, -importancia)
+importancia
+
+# importancia[variable == "canario"]
+
+```
+
+What?
+
+-   ¿Qué sucedió?
+-   ¿Qué hago?
+-   <https://www.youtube.com/watch?v=86URGgqONvA> ???
+
+Resta sin lugar a dudas un importante trabajo de parametrización, al igual que medir los modelos con la función de *ganancia* y no sólo con el *auc*.
+Sin embargo dejaremos estos pasos al alumno con curiosidad de ver y entender porque este precioso algoritmo es de elite, aunque ya no más, el mejor.
+
+Break time
+
+$$\\[3in]$$
+
+Continuamos con los ensambles de boosting.
+Estos se construyen de forma serial.
+Primero se parte de un modelo (que puede ser un valor constante) y se complementa con un modelo que busca mejorar al anterior.
+
+Hay dos algoritmos muy conocidos de este tipo:
+
+-   **Adaboost**: Que cada nuevo modelo va mejorando a los anteriores poniendo un peso mayor en los casos donde la clasificación es incorrecta
+
+-   **Gradient Boosting**: Que cada nuevo modelo va mejorando los anteriores, tratando de corregir los residuos, buscando estos últimos con el gradiente de una función de perdida.
+
+Este último se empezó a hacer muy popular por la excelente pieza de tecnología que es su implementación **xgboost**.
+Podemos entender un poco más de esta implementación
+
+-   [Tutorial](https://xgboost.readthedocs.io/en/latest/tutorials/model.html)
+
+-   [Parámetros](https://xgboost.readthedocs.io/en/latest/parameter.html)
+
+Veamos como usarlo para a paso para nuestro problema
+
+-   Primero tenemos que serializar los datos:
+
+```{r}
+
+library(xgboost)
+
+clases <- as.numeric(ds$clase_binaria) - 1
+ds$clase_binaria <- NULL
+
+dtrain   <- xgb.DMatrix( data = data.matrix(ds),  label = clases, missing=NA )
+
+```
+
+La librería nos incluye la posibilidad de hacer **cv**, sin necesidad de código adicional, vemos rápidamente en que consisten los parámetros y ejecutemos el primer ajuste.
+
+```{r}
+set.seed(semillas[1])
+t0 <- Sys.time()
+
+modelo1 = xgb.cv( 
+  
+				data = dtrain,  
+				missing = NA,
+				stratified = TRUE,       
+				
+				nround= 20,
+				nfold = 5,
+				
+				watchlist = list(metric='auc'),
+				early_stopping_rounds = 50,
+				
+				
+				# feval = ganancia,
+				eval_metric= "auc",
+				
+				maximize =TRUE,
+				subsample = 1, 
+	 			colsample_bytree = 1, 
+		    eta = 0.3,
+ 				min_child_weight = 1, 
+	 			max_depth = 6,
+		 		alpha = 0, 
+				lambda = 0, 
+				base_score = sum(clases) / length(clases),
+
+ 				objective="binary:logistic",
+				
+				verbose = 2
+			)
+
+t1 <- Sys.time()
+
+print(paste0("El tiempo que tardó en ajustar XGB es:", as.numeric(  t1 - t0, units = "secs"), collapse = " "))
+
+```
+
+Veamos el modelo resultante
+
+```{r}
+modelo1$best_iteration
+modelo1$best_ntreelimit
+```
+
+¿No es interesante que con una simple ejecución con casi todos parámetros por *default* ya estamos con un mejor modelo?
+Y a su vez, tardó menos un **cv** que lo que tarda hacer 1 árbol en **rpart**.
+
+Probemos sumando dos parámetros más:
+
+```{r}
+
+set.seed(semillas[1])
+t0 <- Sys.time()
+
+modelo1 <- xgb.cv( 
+				data = dtrain,  
+				missing = NA,
+				stratified = TRUE,       
+				nround= 20,
+				nfold = 5,
+				watchlist = list(metric='auc'),
+				early_stopping_rounds = 50,
+				eval_metric= "auc",
+				maximize =TRUE,
+				subsample = 1, 
+	 			colsample_bytree = 1, 
+		    eta = 0.3,
+ 				min_child_weight = 1, 
+	 			max_depth = 6,
+		 		alpha = 0, 
+				lambda = 0, 
+ 				objective="binary:logistic",
+				####
+				tree_method = "hist",
+				grow_policy="lossguide",
+				####
+				verbose = 2
+			)
+
+t1 <- Sys.time()
+
+print(paste0("El tiempo que tardó en ajustar XGB es:", as.numeric(  t1 - t0, units = "secs"), collapse = " "))
+
+```
+
+Ahora, no solo dio más rápido, sino incluso *algo* mejor.
+
+**Pregunta**
+
+-   ¿Por qué se dio ese diferencia tan grande de tiempos?
+
+Hasta ahora veníamos midiendo la calidad de los parámetros, vemos como obtener el modelo final:
+
+```{r}
+
+modelo_xgb_1 = xgb.train( 
+				data = dtrain,
+				nround= 20, # poner la mejor ronda
+				objective="binary:logistic",
+			  verbose = 2
+			)
+```
+
+```{r}
+
+noviembre <- "paquete_premium_202011.csv"
+
+ds_nov <- fread(paste0(carpeta_datasetsOri, noviembre,collapse = ""), header=TRUE, showProgress = FALSE)
+ds_nov$clase_ternaria <- NULL
+
+
+pred_nov <- predict(modelo_xgb_1, data.matrix(ds_nov),  type = "prob")
+
+length(unique(pred_nov))
+```
+
+Y si queremos generar el archivo de envío a **kaggle**
+
+```{r}
+#Genero la entrega para Kaggle
+entrega  <- as.data.table( list( "numero_de_cliente"= ds_nov[, numero_de_cliente],
+                                 "Predicted"= as.numeric(pred_nov > 0.025) ) ) 
+```
+
+Pero antes de siquiera pensar en subir algo, tenemos varias cosas por hacer.
+
+Ahora exploramos algunos de los otros atributos que tiene el paquete `XGBoost`, el primero es la importancia de variables:
+
+```{r}
+
+xgb.importance(colnames(dtrain), model = modelo_xgb_1)
+
+```
+
+-   ¿Qué diferencias nota con respecto con la importancia de variables del **rf**?
+
+Juguemos una vez más con una variable canario:
+
+```{r}
+ds_can <- ds
+ds_can$canario <- runif(nrow(ds))
+
+dtrain2   <- xgb.DMatrix( data = data.matrix(ds_can),  label = clases, missing=NA )
+
+
+modelo_xgb_2 <- xgb.train( 
+				data = dtrain2,
+				nround= 20,
+				maximize =TRUE,
+				objective="binary:logistic",
+				tree_method = "hist",
+				grow_policy="lossguide",
+			  verbose = 2
+			)
+
+
+```
+
+Veamos en que posición aparece la variable canario:
+
+```{r}
+xgb.importance(colnames(dtrain2), model = modelo_xgb_2)
+```
+
+Vemos un menor sobreajuste en la configuración por defecto del `XGBoost` que la del `RF`.
+Sin embargo, todavía hay y reducir ese sobreajuste puede sumarnos mucho valor.
+
+**Pregunta**
+
+-   ¿Cuáles son los parámetros que nos ayudan a controlar el `overfitting`?
+
+::: {.tarea}
+**TAREA (si hay tiempo, lo empezamos en clase)**
+
+Usando los retazos de código de los R markdown, escribir 2 script en R
+
+-   Una búsqueda bayesiana para un **xgboost**
+
+-   Aplicar el mejor modelo y obtener una entrega para **kaggle**
+
+Luego subir la entrega a **kaggle**, subir los scripts a <https://gist.github.com/> y compartirlos en chat de la clase.
+:::
+
+En la clase revisamos las formas de construir algoritmos basados en ensambles.
+Hay un ensamble que les puede ser muy útil en esta primera competencia (y también en la segunda), el **stacking**.
+Iremos hablando de esta técnica en las siguientes clases, pero anticipamos que esta técnica responde a la pregunta:
+
+Hice muchos modelos para la competencia, hay una forma inteligente de ensamblarlos?
+
+------------------------------------------------------------------------
